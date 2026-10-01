@@ -1,0 +1,15 @@
+# maturin build system for the qppocr Python bindings (crates/qppocr-py).
+[build-system]
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "qppocr"
+version = "0.2.1"
+description = "Python bindings for the qppocr pure-Rust PP-OCRv6 inference engine"
+requires-python = ">=3.8"
+license = "MIT OR Apache-2.0"
+
+[tool.maturin]
+manifest-path = "crates/qppocr-py/Cargo.toml"
+module-name = "qppocr"

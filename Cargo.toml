@@ -5,6 +5,7 @@ members = [
     "crates/qppocr-core",
     "crates/qppocr-kernels",
     "crates/qppocr-cli",
+    "crates/qppocr-py",
 ]
 
 [workspace.package]
