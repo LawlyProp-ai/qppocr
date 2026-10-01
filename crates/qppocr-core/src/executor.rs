@@ -1237,10 +1237,6 @@ impl Session {
                     prof_bytes += this;
                     *prof_b.entry(key2).or_insert(0) += this;
                 }
-                #[allow(unused_assignments)]
-                {
-                    let _ = &op_t0;
-                }
                 // 对拍落盘（ QPPOCR_DUMP_DIR 同格式：%06d.f32 + manifest.tsv）
                 if let Some(dir) = &dump_dir {
                     if let Some(t) = arena.get(&n.outputs[0]) {

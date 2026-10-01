@@ -9,8 +9,7 @@
 //! 每个内核文件的结构（循环顺序、分块、寄存器分配意图、位级语义）
 //! 有明确约定；注释里的性能结论来自本项目的参考环境，仅供参考。
 //!
-//! `scalar`（本 crate 的标量参考实现）不是备用方案，是判据：SIMD 版与它
-//! 逐位比对。
+//! 每个内核文件自带标量参考实现，SIMD 版与它逐位比对（见 tests/bitexact.rs）。
 //!
 //! 架构接线只出现在 [`arch`]（分发层）与各后端文件（[`x86`]、
 //! [`aarch64`]）；内核文件本身与架构无关。设备级执行（GPU）不属於
@@ -36,7 +35,6 @@ pub mod par;
 mod pool;
 pub mod pool2d;
 pub mod resize;
-pub mod scalar;
 pub mod shape;
 
 #[cfg(target_arch = "x86_64")]

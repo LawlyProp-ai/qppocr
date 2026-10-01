@@ -69,11 +69,6 @@ pub(crate) fn serial_exec() -> bool {
     SERIAL_EXEC.with(|c| c.get())
 }
 
-/// 一次 fork 的协调成本（16 线程实测 ~97us）。
-/// 只是文档性常量；实际门控在 [`crate::par::Thresholds`]。
-#[allow(dead_code)]
-pub(crate) const FORK_US: f64 = 97.0;
-
 /// join 纯自旋的轮数上限，之后退化为让出（见 fork_join 的 join 注释）。
 /// 一次 PAUSE ~1-2ns 级，2048 轮 ≈ 数微秒——覆盖无争用的常规 fork。
 const JOIN_SPIN: u32 = 2048;

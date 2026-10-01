@@ -75,12 +75,11 @@ jobs:
       matrix:
         features:
           - ""
-          - "std"
-          - "std,parallel"
+          - "parallel"
           - "image-decode"
-          - "std,parallel,image-decode"
-          - "serde,std"
-          - "serde,std,parallel,image-decode"
+          - "parallel,image-decode"
+          - "serde"
+          - "serde,parallel,image-decode"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

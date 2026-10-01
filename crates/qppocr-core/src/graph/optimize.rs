@@ -64,8 +64,6 @@ pub fn fuse_gelu(g: &mut Graph) -> i64 {
     // 执行器（按序走 + 重试未就绪节点）就要跑跟交错融合数一样多的趟数。
     let mut replace: HashMap<usize, Node> = HashMap::new();
 
-    let nodes = std::sync::Arc::new(std::sync::Mutex::new(()));
-    let _ = nodes; // 占位说明：node_at 只读借用 g.nodes，与 replace 阶段无重叠
     let node_at = |nm: &str| -> Option<&Node> { producer.get(nm).map(|&i| &g.nodes[i]) };
 
     for i in 0..g.nodes.len() {
@@ -498,9 +496,6 @@ pub fn fuse_mul_add(g: &mut Graph) -> i64 {
     n
 }
 
-/// Conv 后紧跟单消费者 Add(bias)：bias 折进 Conv 第三输入。
-/// 省掉最常见的一次 Add 的读改写——转换版模型把 bias 拆成独立 Add
-///（上游原件折在 Conv 里，这个 pass 对它们是 no-op）。
 /// Conv → BatchNormalization 折叠：BN 的仿射直接乘进 conv 的权重与 bias。
 ///
 /// 数学上恒等：`y = (W∗x + b − μ)·γ/σ + β = (W·γ/σ)∗x + ((b−μ)·γ/σ + β)`。

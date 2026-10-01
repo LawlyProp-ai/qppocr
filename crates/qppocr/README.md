@@ -50,8 +50,8 @@ model files is verified at load time unless verification is disabled.
   including EXIF orientation. Turn it off when the host supplies pixels.
 - `parallel` (default) — multithreaded kernels. Off = single-threaded engine.
 - `serde` — serializable result types.
-- `std` — off for no_std targets; models then load from bytes via
-  `ModelSource`.
+
+The crates link `std` unconditionally; there is no `no_std` mode.
 
 ## CLI
 

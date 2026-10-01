@@ -64,12 +64,10 @@ impl BinOp {
     }
 }
 
-/// 广播元数据：shape 与两侧步长，全部按**反转序**存（下标 0 = 最快变化维）。
+/// 广播元数据：shape 与 b 侧步长，全部按**反转序**存（下标 0 = 最快变化维）。
 struct BroadcastMeta {
     shape: Vec<i64>,
     /// 就地路径只读 `strb`；`binary_op` 自算两侧步长。
-    #[allow(dead_code)]
-    stra: Vec<i64>,
     strb: Vec<i64>,
 }
 
@@ -92,19 +90,13 @@ fn broadcast_meta(a_shape: &[i64], b_shape: &[i64]) -> Option<BroadcastMeta> {
         }
         shape[i] = da.max(db);
     }
-    let mut stra = vec![0i64; r];
     let mut strb = vec![0i64; r];
-    let mut acc = 1i64;
-    for i in 0..ra {
-        stra[i] = if dim_at(a_shape, i) == 1 { 0 } else { acc };
-        acc *= dim_at(a_shape, i);
-    }
     let mut acc = 1i64;
     for i in 0..rb {
         strb[i] = if dim_at(b_shape, i) == 1 { 0 } else { acc };
         acc *= dim_at(b_shape, i);
     }
-    Some(BroadcastMeta { shape, stra, strb })
+    Some(BroadcastMeta { shape, strb })
 }
 
 /// `a` 的形状是否已经等于 `a op b` 的广播结果（能就地做，省一次分配和

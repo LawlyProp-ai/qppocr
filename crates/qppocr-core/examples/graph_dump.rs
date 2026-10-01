@@ -4,16 +4,23 @@
 //! 用途：找可变现的算子融合。逐算子的耗时表看不出拓扑——`Add` 前面是
 //! `Resize` 还是 `Conv`，能省的搬运量差一倍以上。
 //!
-//! cargo run --release -p qppocr-core --example graph_dump -- <model.onnx> [只打印含此子串的]
+//! cargo run --release -p qppocr-core --example graph_dump -- <model.onnx> [只打印含此子串的] [--attrs]
 
 use std::collections::HashMap;
 
 fn main() {
-    let path = std::env::args()
-        .nth(1)
-        .expect("用法: graph_dump <model.onnx> [过滤子串]");
-    let filter = std::env::args().nth(2);
-    let g = qppocr_core::onnx::load_onnx(std::path::Path::new(&path)).unwrap();
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("用法: graph_dump <model.onnx> [过滤子串] [--attrs]");
+        return;
+    }
+    let attrs = args.iter().any(|a| a == "--attrs");
+    let mut positional = args.iter().skip(1).filter(|a| !a.starts_with("--"));
+    let path = positional
+        .next()
+        .expect("用法: graph_dump <model.onnx> [过滤子串] [--attrs]");
+    let filter = positional.next();
+    let g = qppocr_core::onnx::load_onnx(std::path::Path::new(path)).unwrap();
 
     // 张量元素数：从 initializer 或图输入拿；中间张量从产出它的节点的属性推
     let mut elems: HashMap<String, i64> = HashMap::new();
@@ -77,6 +84,27 @@ fn main() {
             "#{i:<4} {:<18} 读{rd:>9} 写{wr:>9}   {:?}  ->  {:?}",
             n.op_type, ins, outs
         );
+        if attrs {
+            println!("node[{i}] {} {}", n.op_type, n.name);
+            println!("  inputs: {:?}", n.inputs);
+            println!("  outputs: {:?}", n.outputs);
+            for a in &n.attrs {
+                println!(
+                    "  attr {} f={:?} i={} s={:?} ints={:?} floats={:?}",
+                    a.name,
+                    if a.has_f { Some(a.f) } else { None },
+                    a.i,
+                    if a.has_s { Some(&a.s) } else { None },
+                    a.ints,
+                    a.floats
+                );
+            }
+            for inn in &n.inputs {
+                if let Some(t) = g.initializers.get(inn) {
+                    println!("  init {inn}: shape={:?} dtype={:?}", t.shape, t.dtype);
+                }
+            }
+        }
     }
     println!(
         "\n合计（估算）{} 个 float = {} MB",

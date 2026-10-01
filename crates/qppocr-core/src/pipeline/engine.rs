@@ -735,7 +735,6 @@ impl Engine {
         }
 
         // ---- 检测 ----
-        let _t_det0 = now();
         let (dh, dw) = (work.h, work.w);
         let mut dratio = 1.0f64;
         if dh.min(dw) < self.cfg.det_limit_side_len {

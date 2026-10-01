@@ -6,7 +6,6 @@
 /models/
 *.onnx
 *.onnx.data
-*.lwm
 
 # 编辑器与系统
 .idea/
@@ -15,9 +14,11 @@
 Thumbs.db
 
 # 对拍/基准临时产物
-tools/*.f32
 *.f32
 
 # Python
 __pycache__/
 *.pyc
+.opencode/
+openspec/
+TODO.md

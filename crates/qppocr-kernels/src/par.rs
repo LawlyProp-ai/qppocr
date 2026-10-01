@@ -47,8 +47,6 @@ impl Default for Thresholds {
     }
 }
 
-static THRESHOLDS: std::sync::OnceLock<Thresholds> = std::sync::OnceLock::new();
-
 /// 当前生效的并行门槛。
 pub fn thresholds() -> &'static Thresholds {
     // 诊断用：QPPOCR_FORK_MACS / QPPOCR_GEMM_MIN / QPPOCR_ELEM_MIN 可覆盖，
@@ -78,11 +76,6 @@ pub fn thresholds() -> &'static Thresholds {
             t
         })
     }
-}
-
-#[allow(dead_code)]
-fn thresholds_orig() -> &'static Thresholds {
-    THRESHOLDS.get_or_init(Thresholds::default)
 }
 
 /// 工作量（MAC 数）是否值得 fork。

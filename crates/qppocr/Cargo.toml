@@ -13,8 +13,7 @@ keywords = ["ocr", "paddleocr", "onnx", "inference", "text-recognition"]
 categories = ["computer-vision", "text-processing"]
 
 [features]
-default = ["std", "parallel", "image-decode"]
-std = []
+default = ["parallel", "image-decode"]
 # 关掉 = 单线程（WASM/嵌入式用）
 parallel = ["qppocr-core/parallel"]
 # 图像解码（JPEG/PNG）。关掉 = 只吃已解码像素

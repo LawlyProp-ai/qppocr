@@ -108,8 +108,7 @@ pub fn min_area_rect(hull: &[Pt]) -> (Option<[Pt; 4]>, f32) {
             best_min = w.min(h);
             let us = [min_u, max_u, max_u, min_u];
             let vs = [min_v, min_v, max_v, max_v];
-            for (k, ((u, v), bk)) in us.iter().zip(vs.iter()).zip(best.iter_mut()).enumerate() {
-                let _ = k;
+            for ((u, v), bk) in us.iter().zip(vs.iter()).zip(best.iter_mut()) {
                 bk.x = u * ex - v * ey;
                 bk.y = u * ey + v * ex;
             }
@@ -389,31 +388,6 @@ pub fn db_postprocess(
 }
 
 // ================================================================ 框合并
-
-/// 轴对齐外接框。
-struct BoxBounds {
-    x0: f32,
-    y0: f32,
-    x1: f32,
-    y1: f32,
-}
-
-#[allow(dead_code)]
-fn box_bounds(pts: &[[f32; 2]; 4]) -> BoxBounds {
-    let mut b = BoxBounds {
-        x0: 3.4e38,
-        y0: 3.4e38,
-        x1: -3.4e38,
-        y1: -3.4e38,
-    };
-    for p in pts {
-        b.x0 = b.x0.min(p[0]);
-        b.x1 = b.x1.max(p[0]);
-        b.y0 = b.y0.min(p[1]);
-        b.y1 = b.y1.max(p[1]);
-    }
-    b
-}
 
 /// 框自身的坐标系：中心、行方向单位向量、法向、半长、半高。
 #[derive(Clone, Copy)]

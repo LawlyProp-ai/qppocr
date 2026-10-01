@@ -86,7 +86,6 @@ pub fn resize_bilinear_img(src: &Image, dw: i32, dh: i32) -> Image {
         x1[x] = (i0 + 1).min(src.w - 1);
         fx[x] = v - i0 as f32;
     }
-    let sw = src.w as usize;
     for y in 0..dh {
         let v = ((y as f32 + 0.5) * sy - 0.5).max(0.0);
         let j0 = (v as i32).min(src.h - 1);
@@ -113,7 +112,6 @@ pub fn resize_bilinear_img(src: &Image, dw: i32, dh: i32) -> Image {
                 out[x as usize * c + ch] = (val + 0.5).clamp(0.0, 255.0) as u8;
             }
         }
-        let _ = sw;
     }
     dst
 }

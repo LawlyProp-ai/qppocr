@@ -65,6 +65,6 @@ is fixed and does not depend on thread count.
 ## Features
 
 - `parallel` (default) — thread pool and forking. Turn it off for
-  single-threaded or no-std-adjacent builds; every kernel then runs inline.
+  single-threaded builds; every kernel then runs inline.
 
 License: MIT OR Apache-2.0.
