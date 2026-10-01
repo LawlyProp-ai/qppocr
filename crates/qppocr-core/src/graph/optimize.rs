@@ -53,6 +53,20 @@ fn consumer_map(g: &Graph) -> HashMap<String, i64> {
     c
 }
 
+/// tensor 名 -> **第一个**读者的节点下标（按节点顺序，`or_insert` 保留下标最小者；
+/// owned，同上）。空输入名跳过。
+fn consumer_of_map(g: &Graph) -> HashMap<String, usize> {
+    let mut c: HashMap<String, usize> = HashMap::new();
+    for (i, n) in g.nodes.iter().enumerate() {
+        for inn in &n.inputs {
+            if !inn.is_empty() {
+                c.entry(inn.clone()).or_insert(i);
+            }
+        }
+    }
+    c
+}
+
 /// GELU 子图坍缩：`c3·(Mul(X·(Add(Erf(Div(X,c1)),c2))))` 五个节点
 ///（Div/Erf/Add/Mul/Mul——导出器就这么拆的）换成一个 FusedGelu。
 pub fn fuse_gelu(g: &mut Graph) -> i64 {
@@ -335,17 +349,8 @@ pub fn drop_identity_pairs(g: &mut Graph) -> i64 {
 ///（erf256_ps 把一次除法和一堆常数拖进已经占满 16 个 YMM 的循环）。
 /// 写后 pass 不占 GEMM 寄存器。
 pub fn fuse_conv_activation(g: &mut Graph) -> i64 {
-    let mut consumers: HashMap<String, i64> = HashMap::new();
-    let mut consumer_of: HashMap<String, usize> = HashMap::new();
-    for (i, n) in g.nodes.iter().enumerate() {
-        for inn in &n.inputs {
-            if inn.is_empty() {
-                continue;
-            }
-            *consumers.entry(inn.clone()).or_insert(0) += 1;
-            consumer_of.entry(inn.clone()).or_insert(i);
-        }
-    }
+    let consumers = consumer_map(g);
+    let consumer_of = consumer_of_map(g);
 
     let mut fuse: Vec<(usize, usize)> = Vec::new(); // (conv 下标, 激活下标)
     for i in 0..g.nodes.len() {
@@ -508,14 +513,7 @@ pub fn fuse_mul_add(g: &mut Graph) -> i64 {
 /// 并行扩展的 Amdahl 构成。
 pub fn fold_conv_batchnorm(g: &mut Graph) -> i64 {
     let consumers = consumer_map(g);
-    let mut consumer_of: HashMap<String, usize> = HashMap::new();
-    for (i, n) in g.nodes.iter().enumerate() {
-        for inn in &n.inputs {
-            if !inn.is_empty() {
-                consumer_of.entry(inn.clone()).or_insert(i);
-            }
-        }
-    }
+    let consumer_of = consumer_of_map(g);
 
     let mut fold: Vec<(usize, usize, usize)> = Vec::new(); // (conv 下标, BN 下标, 输出通道数)
     for i in 0..g.nodes.len() {
@@ -664,14 +662,7 @@ pub fn fuse_conv_residual(g: &mut Graph) -> i64 {
             producer_of.insert(o.clone(), i);
         }
     }
-    let mut consumer_of: HashMap<String, usize> = HashMap::new();
-    for (i, n) in g.nodes.iter().enumerate() {
-        for inn in &n.inputs {
-            if !inn.is_empty() {
-                consumer_of.entry(inn.clone()).or_insert(i);
-            }
-        }
-    }
+    let consumer_of = consumer_of_map(g);
 
     let mut fuse: Vec<(usize, usize)> = Vec::new(); // (conv, add)
     for i in 0..g.nodes.len() {
@@ -770,14 +761,7 @@ pub fn fuse_conv_residual(g: &mut Graph) -> i64 {
 pub fn fold_conv_bias(g: &mut Graph) -> i64 {
     let consumers = consumer_map(g);
     // tensor -> 唯一读者的下标
-    let mut consumer_of: HashMap<String, usize> = HashMap::new();
-    for (i, n) in g.nodes.iter().enumerate() {
-        for inn in &n.inputs {
-            if !inn.is_empty() {
-                consumer_of.entry(inn.clone()).or_insert(i);
-            }
-        }
-    }
+    let consumer_of = consumer_of_map(g);
 
     let mut absorb: Vec<(usize, usize)> = Vec::new(); // (conv 下标, add 下标)
     for i in 0..g.nodes.len() {

@@ -122,14 +122,8 @@ pub struct Timings {
     pub total_ms: f64,
 }
 
-/// 计时起点（`start.elapsed_ms()` 得毫秒）。字段一律以 `*_ms` 结尾。
-trait ElapsedMs {
-    fn elapsed_ms(&self) -> f64;
-}
-impl ElapsedMs for std::time::Instant {
-    fn elapsed_ms(&self) -> f64 {
-        self.elapsed().as_secs_f64() * 1000.0
-    }
+fn ms(i: &std::time::Instant) -> f64 {
+    i.elapsed().as_secs_f64() * 1000.0
 }
 fn now() -> std::time::Instant {
     std::time::Instant::now()
@@ -432,16 +426,29 @@ impl Engine {
         Ok(first)
     }
 
-    /// 把 `batches`（`(begin, end)` 下标对）分给 N 个线程并行执行，
-    /// **每个线程内部串行**（`par::set_serial_execution(true)`）。
+    /// 把 `batches`（`(begin, end)` 下标对）分给若干线程并行执行。
     ///
-    /// 为什么不是每批一个 `parallel_for`：行内的算子级 fork 会争池子的
-    /// `fork_mu` 互相排队，扩展性受损。改成「每行一个线程、行内串行」后，
-    /// 墙钟 ≈ 最慢单行的耗时。
-    ///
-    /// 串行执行**不改切分决策**（`par::threads()` 仍报真实池大小），
+    /// 默认（`shards = None`）每个线程内部**串行**
+    /// （`par::set_serial_execution(true)`）。为什么不是每批一个
+    /// `parallel_for`：行内的算子级 fork 会争池子的 `fork_mu` 互相排队，
+    /// 扩展性受损。改成「每行一个线程、行内串行」后，墙钟 ≈ 最慢单行的
+    /// 耗时。串行执行**不改切分决策**（`par::threads()` 仍报真实池大小），
     /// 因此各内核的分块与累加序与并行路径完全一致——逐位可验证。
-    fn run_batches<T, F>(batches: &[(usize, usize)], f: F) -> Result<Vec<T>>
+    ///
+    /// `shards = Some(k)` 且 `k >= 2` 时每个外层线程用**自己的分片池**
+    /// （`pool_slot` 1..=k），批内的算子还能在本池内 fork——单池下并发的
+    /// fork 会被 `fork_mu` 串起来，外层线程互相排队。k < 2 退回默认路径。
+    /// 每行的算子数 ~80 且顺序依赖，外层线程不能太多（分片池会太小、每池
+    /// 的 fork 收益盖不过协调成本）；k 由 `rec_shards` 定。
+    ///
+    /// ★ 两种调度只能二选一（池不支持嵌套 fork）。这里只是把两条路径并进
+    ///   同一个扇出：调度调用 `set_serial_execution` / `set_pool_slot` 以及
+    ///   是否带行级 debug 都各按原路径原样保留。
+    fn run_batches<T, F>(
+        batches: &[(usize, usize)],
+        f: F,
+        shards: Option<usize>,
+    ) -> Result<Vec<T>>
     where
         T: Send,
         F: Fn(usize, usize) -> Result<T> + Sync,
@@ -450,6 +457,47 @@ impl Engine {
         if n == 0 {
             return Ok(Vec::new());
         }
+
+        // ---- 分片路径：每个外层线程一个独立分片池，批内可再 fork ----
+        if let Some(k) = shards.map(|s| s.min(n).max(1)).filter(|&k| k >= 2) {
+            use std::sync::Mutex;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let next = AtomicUsize::new(0);
+            let slots: Vec<Mutex<Option<Result<T>>>> = (0..n).map(|_| Mutex::new(None)).collect();
+            std::thread::scope(|s| {
+                let (fr, nr, sr) = (&f, &next, &slots);
+                for j in 0..k {
+                    let jj = j;
+                    s.spawn(move || {
+                        // 本线程的 fork 走分片池 jj+1（0 号是默认池）。
+                        qppocr_kernels::par::set_pool_slot(1 + jj);
+                        loop {
+                            let i = nr.fetch_add(1, Ordering::Relaxed);
+                            if i >= n {
+                                break;
+                            }
+                            let (b, e) = batches[i];
+                            let r = fr(b, e);
+                            *sr[i].lock().unwrap() = Some(r);
+                        }
+                    });
+                }
+            });
+            let mut out = Vec::with_capacity(n);
+            for slot in slots {
+                match slot.into_inner().unwrap() {
+                    Some(r) => out.push(r?),
+                    None => {
+                        return Err(Error::Graph(
+                            "run_batches_sharded: 批次槽未回填（内部错误）".into(),
+                        ));
+                    }
+                }
+            }
+            return Ok(out);
+        }
+
+        // ---- 默认路径：每个线程内部串行，不走线程内 fork ----
         let cap = std::env::var("QPPOCR_ROW_THREADS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
@@ -507,62 +555,6 @@ impl Engine {
             match slot.into_inner().unwrap() {
                 Some(r) => out.push(r?),
                 None => return Err(Error::Graph("run_batches: 批次槽未回填（内部错误）".into())),
-            }
-        }
-        Ok(out)
-    }
-
-    /// 与 [`Self::run_batches`] 同样按批扇出，但每个外层线程用**自己的
-    /// 分片池**（`pool_slot` 1..=k），于是批内的算子还能在本池内 fork——
-    /// 单池下并发的 fork 会被 `fork_mu` 串起来，外层线程互相排队。
-    ///
-    /// 每行的算子数 ~80 且顺序依赖，外层线程不能太多（分片池会太小、
-    /// 每池的 fork 收益盖不过协调成本）；k 由 `rec_shards` 定。
-    fn run_batches_sharded<T, F>(batches: &[(usize, usize)], f: F, shards: usize) -> Result<Vec<T>>
-    where
-        T: Send,
-        F: Fn(usize, usize) -> Result<T> + Sync,
-    {
-        let n = batches.len();
-        if n == 0 {
-            return Ok(Vec::new());
-        }
-        let k = shards.min(n).max(1);
-        if k < 2 {
-            return Self::run_batches(batches, f);
-        }
-        use std::sync::Mutex;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let next = AtomicUsize::new(0);
-        let slots: Vec<Mutex<Option<Result<T>>>> = (0..n).map(|_| Mutex::new(None)).collect();
-        std::thread::scope(|s| {
-            let (fr, nr, sr) = (&f, &next, &slots);
-            for j in 0..k {
-                let jj = j;
-                s.spawn(move || {
-                    // 本线程的 fork 走分片池 jj+1（0 号是默认池）。
-                    qppocr_kernels::par::set_pool_slot(1 + jj);
-                    loop {
-                        let i = nr.fetch_add(1, Ordering::Relaxed);
-                        if i >= n {
-                            break;
-                        }
-                        let (b, e) = batches[i];
-                        let r = fr(b, e);
-                        *sr[i].lock().unwrap() = Some(r);
-                    }
-                });
-            }
-        });
-        let mut out = Vec::with_capacity(n);
-        for slot in slots {
-            match slot.into_inner().unwrap() {
-                Some(r) => out.push(r?),
-                None => {
-                    return Err(Error::Graph(
-                        "run_batches_sharded: 批次槽未回填（内部错误）".into(),
-                    ));
-                }
             }
         }
         Ok(out)
@@ -806,7 +798,7 @@ impl Engine {
                 }
             }
         }
-        res.timings.det_pre_ms = t_pre0.elapsed_ms();
+        res.timings.det_pre_ms = ms(&t_pre0);
 
         let t_inf0 = now();
         let det_out = self.det.run(vec![(
@@ -819,7 +811,7 @@ impl Engine {
                 i64: Vec::new(),
             },
         )])?;
-        res.timings.det_infer_ms = t_inf0.elapsed_ms();
+        res.timings.det_infer_ms = ms(&t_inf0);
         let pred = &det_out[0];
 
         let t_post0 = now();
@@ -843,7 +835,7 @@ impl Engine {
 
         sort_reading_order(&mut boxes);
         res.num_merged = merge_same_line(&mut boxes, self.cfg.merge_line_gap as f32);
-        res.timings.det_post_ms = t_post0.elapsed_ms();
+        res.timings.det_post_ms = ms(&t_post0);
 
         // 检测器坐标 → 图像坐标：work 是检测器的私有副本（缩过/补过边），
         // 两个比率映射回来；补边量减掉。调用方看到的坐标永远在原图上。
@@ -867,7 +859,7 @@ impl Engine {
                 to_image(&b.pts, &mut l.pts);
                 res.lines.push(l);
             }
-            res.timings.total_ms = t_start.elapsed_ms();
+            res.timings.total_ms = ms(&t_start);
             return Ok(res);
         }
 
@@ -951,7 +943,7 @@ impl Engine {
                 }
             }
         }
-        res.timings.crop_ms = t_crop0.elapsed_ms();
+        res.timings.crop_ms = ms(&t_crop0);
 
         // ---- 方向分类：并入下方逐行扇出（每行先分类后识别，见 run_batches）
         // 旧实现是独立的一串串行 cls 批（~8.5 ms 纯串行），现在每行在自己
@@ -1059,7 +1051,7 @@ impl Engine {
                         o.f32[k * 2 + 1] > o.f32[k * 2] && o.f32[k * 2 + 1] >= self.cfg.cls_thresh
                     })
                     .collect())
-            })?;
+            }, None)?;
             let decisions: Vec<bool> = decisions.into_iter().flatten().collect();
             for (i, &flip) in decisions.iter().enumerate() {
                 if flip {
@@ -1068,7 +1060,7 @@ impl Engine {
                     line_crop[i] = std::borrow::Cow::Owned(rotate_image(&crops[i], 180));
                 }
             }
-            res.timings.cls_ms = t_ri.elapsed_ms();
+            res.timings.cls_ms = ms(&t_ri);
         }
         let t_ri = now(); // ★ 重新起表：cls 的墙钟不能算进 rec
         let rec_fn = |beg: usize, end: usize| -> Result<Vec<RecLineOut>> {
@@ -1193,12 +1185,8 @@ impl Engine {
         //   1.43x（tiny）——rec 的算子虽大，但每行 ~80 个算子顺序依赖，
         //   每次 fork ~97 us 的协调开销乘上去不划算。换方案前先看这条。
         let shards = self.cfg.rec_shards;
-        let outs = if shards > 1 {
-            Self::run_batches_sharded(&batches, rec_fn, shards)?
-        } else {
-            Self::run_batches(&batches, rec_fn)?
-        };
-        res.timings.rec_infer_ms += t_ri.elapsed_ms();
+        let outs = Self::run_batches(&batches, rec_fn, (shards > 1).then_some(shards))?;
+        res.timings.rec_infer_ms += ms(&t_ri);
 
         // ---- 合并（串行）：并行段只产出结果，这里统一写回 ----
         for batch_out in outs {
@@ -1211,7 +1199,7 @@ impl Engine {
                 to_image(&boxes[i].pts, &mut lines[i].pts);
             }
         }
-        res.timings.total_ms = t_start.elapsed_ms();
+        res.timings.total_ms = ms(&t_start);
 
         // 读不出的框保留不丢（见 TextLine::text 文档）
         res.num_unread = lines.iter().filter(|l| l.text.is_empty()).count();

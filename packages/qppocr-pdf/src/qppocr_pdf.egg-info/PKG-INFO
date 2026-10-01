@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: qppocr-pdf
+Version: 0.1.0
+Summary: Per-page PDF routing between embedded text and qppocr OCR
+License-Expression: MIT OR Apache-2.0
+Requires-Python: >=3.9
+Requires-Dist: qppocr
+Requires-Dist: pypdfium2==5.13.0
+Requires-Dist: Pillow>=10
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
+Requires-Dist: ruff; extra == "dev"
+Requires-Dist: mypy; extra == "dev"
+Requires-Dist: bandit; extra == "dev"
+Requires-Dist: pip-audit; extra == "dev"

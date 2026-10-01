@@ -11,13 +11,13 @@ use crate::buf::F32Buf;
 use crate::gemm::sgemm;
 use crate::par;
 
-/// 泛型 strided 拷贝（f32 版）。`shape/stride` 按输出维度（含最内维）给出。
+/// 泛型 strided 拷贝（f32/i64 共用）。`shape/stride` 按输出维度（含最内维）给出。
 ///
 /// SAFETY（并行形态）：`dst` 的 `[outer_begin*inner, outer_end*inner)` 与
 /// 并发调用者不相交。
-fn copy_strided_f32(
-    src: &[f32],
-    dst: &mut [f32],
+fn copy_strided<T: Copy>(
+    src: &[T],
+    dst: &mut [T],
     shape: &[i64],
     stride: &[i64],
     base: i64,
@@ -58,55 +58,6 @@ fn copy_strided_f32(
             }
         }
         // 进位（保 base 不动）
-        for i in (0..r.saturating_sub(1)).rev() {
-            off += stride[i];
-            idx[i] += 1;
-            if idx[i] < shape[i] {
-                break;
-            }
-            off -= idx[i] * stride[i];
-            idx[i] = 0;
-        }
-    }
-}
-
-/// i64 版（Shape/Gather 等整型张量）。
-fn copy_strided_i64(
-    src: &[i64],
-    dst: &mut [i64],
-    shape: &[i64],
-    stride: &[i64],
-    base: i64,
-    outer_begin: i64,
-    outer_end: i64,
-) {
-    let r = shape.len();
-    if r == 0 || outer_end <= outer_begin {
-        return;
-    }
-    let inner = shape[r - 1];
-    let istr = stride[r - 1];
-    if inner <= 0 {
-        return;
-    }
-    let mut idx = vec![0i64; r.saturating_sub(1).max(1)];
-    let mut off = base;
-    let mut rem = outer_begin;
-    for i in (0..r.saturating_sub(1)).rev() {
-        idx[i] = rem % shape[i];
-        rem /= shape[i];
-        off += idx[i] * stride[i];
-    }
-    for o in outer_begin..outer_end {
-        let d = &mut dst
-            [((o - outer_begin) * inner) as usize..((o - outer_begin + 1) * inner) as usize];
-        if istr == 1 {
-            d.copy_from_slice(&src[off as usize..(off + inner) as usize]);
-        } else {
-            for (k, dv) in d.iter_mut().enumerate() {
-                *dv = src[(off + k as i64 * istr) as usize];
-            }
-        }
         for i in (0..r.saturating_sub(1)).rev() {
             off += stride[i];
             idx[i] += 1;
@@ -272,7 +223,7 @@ fn slice_copy(x_shape: &[i64], out_shape: &[i64], b: &[i64], sp: &[i64], mut kin
                     dstp.offset(ob * out_shape[r - 1] as usize)
                         .slice((oe - ob) * out_shape[r - 1] as usize)
                 };
-                copy_strided_f32(src, dst, out_shape, &stride, base, ob as i64, oe as i64);
+                copy_strided(src, dst, out_shape, &stride, base, ob as i64, oe as i64);
             });
         }
         CopyKind::I64(src, out) => {
@@ -283,7 +234,7 @@ fn slice_copy(x_shape: &[i64], out_shape: &[i64], b: &[i64], sp: &[i64], mut kin
                     dstp.offset(ob * out_shape[r - 1] as usize)
                         .slice((oe - ob) * out_shape[r - 1] as usize)
                 };
-                copy_strided_i64(src, dst, out_shape, &stride, base, ob as i64, oe as i64);
+                copy_strided(src, dst, out_shape, &stride, base, ob as i64, oe as i64);
             });
         }
     }
@@ -322,7 +273,7 @@ pub fn transpose_tensor(x: PayloadRef<'_>, x_shape: &[i64], perm: &[i64]) -> (Pa
                     dstp.offset(b * shape[r - 1] as usize)
                         .slice((e - b) * shape[r - 1] as usize)
                 };
-                copy_strided_f32(d, dst, &shape, &istr, 0, b as i64, e as i64);
+                copy_strided(d, dst, &shape, &istr, 0, b as i64, e as i64);
             });
             (Payload::F32(out), shape)
         }
@@ -335,10 +286,67 @@ pub fn transpose_tensor(x: PayloadRef<'_>, x_shape: &[i64], perm: &[i64]) -> (Pa
                     dstp.offset(b * shape[r - 1] as usize)
                         .slice((e - b) * shape[r - 1] as usize)
                 };
-                copy_strided_i64(d, dst, &shape, &istr, 0, b as i64, e as i64);
+                copy_strided(d, dst, &shape, &istr, 0, b as i64, e as i64);
             });
             (Payload::I64(out), shape)
         }
+    }
+}
+
+/// concat 拷贝的块大小（元素数；等价 128 KB f32）。
+const CONCAT_BLOCK_ELEMS: i64 = 1 << 15;
+
+/// concat 的调度：把每个 (outer, channel) 平面按 [`CONCAT_BLOCK_ELEMS`] 切块，
+/// 从拥有该输出通道的输入（`srcs[si]`）整体拷入。f32/i64 共用；索引与算术
+/// 顺序与原先两条内联路径逐操作一致。
+#[allow(clippy::too_many_arguments)]
+fn copy_concat<T: Copy + Sync>(
+    dst: par::SyncPtr<T>,
+    srcs: &[&[T]],
+    xs_shape: &[&[i64]],
+    axis: usize,
+    offs: &[i64],
+    concat_dim: i64,
+    inner: i64,
+    blocks: i64,
+    units: usize,
+    total: i64,
+    elem: usize,
+) {
+    let body = |ub: usize, ue: usize| {
+        for u in ub..ue {
+            let (o, rem) = (
+                u as i64 / (concat_dim * blocks),
+                u as i64 % (concat_dim * blocks),
+            );
+            let (ch, blk) = (rem / blocks, rem % blocks);
+            let i0 = blk * CONCAT_BLOCK_ELEMS;
+            let len = CONCAT_BLOCK_ELEMS.min(inner - i0);
+            if len <= 0 {
+                continue;
+            }
+            // 哪个输入拥有输出通道 ch，以及它自己的第几通道
+            let mut si = 0usize;
+            while si + 1 < srcs.len().min(16) && offs[si + 1] <= ch {
+                si += 1;
+            }
+            let d = xs_shape[si][axis];
+            let src_off = ((o * d) + (ch - offs[si])) * inner + i0;
+            let dst_off = ((o * concat_dim) + ch) * inner + i0;
+            // SAFETY: 块 (o, ch, blk) 与其他块不相交。
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    srcs[si].as_ptr().add(src_off as usize),
+                    dst.get().add(dst_off as usize),
+                    len as usize,
+                );
+            }
+        }
+    };
+    if par::worth_forking_bytes(total as usize * elem) {
+        par::parallel_for(units.min(1 << 30), 1, body);
+    } else {
+        body(0, units);
     }
 }
 
@@ -383,8 +391,7 @@ pub fn concat_any(
             acc += s[axis];
         }
     }
-    const BLOCK_ELEMS: i64 = 1 << 15; // 128 KB of f32
-    let blocks = 1i64.max((inner + BLOCK_ELEMS - 1) / BLOCK_ELEMS);
+    let blocks = 1i64.max((inner + CONCAT_BLOCK_ELEMS - 1) / CONCAT_BLOCK_ELEMS);
     let units = (outer * concat_dim * blocks) as usize;
 
     let total = outer * concat_dim * inner;
@@ -392,87 +399,50 @@ pub fn concat_any(
         Payload::F32(yd) => {
             // SAFETY: concat 的每个元素都由下方块拷贝写满。
             unsafe { yd.resize_uninit(total as usize) };
-            let dstp = par::SyncPtr::new(yd.as_mut_slice().as_mut_ptr());
-            let body = |ub: usize, ue: usize| {
-                for u in ub..ue {
-                    let (o, rem) = (
-                        u as i64 / (concat_dim * blocks),
-                        u as i64 % (concat_dim * blocks),
-                    );
-                    let (ch, blk) = (rem / blocks, rem % blocks);
-                    let i0 = blk * BLOCK_ELEMS;
-                    let len = BLOCK_ELEMS.min(inner - i0);
-                    if len <= 0 {
-                        continue;
-                    }
-                    // 哪个输入拥有输出通道 ch，以及它自己的第几通道
-                    let mut si = 0usize;
-                    while si + 1 < xs.len().min(16) && offs[si + 1] <= ch {
-                        si += 1;
-                    }
-                    let PayloadRef::F32(src) = xs[si] else {
-                        unreachable!()
-                    };
-                    let d = xs_shape[si][axis];
-                    let src_off = ((o * d) + (ch - offs[si])) * inner + i0;
-                    let dst_off = ((o * concat_dim) + ch) * inner + i0;
-                    unsafe {
-                        // SAFETY: 块 (o, ch, blk) 与其他块不相交。
-                        std::ptr::copy_nonoverlapping(
-                            src.as_ptr().add(src_off as usize),
-                            dstp.get().add(dst_off as usize),
-                            len as usize,
-                        );
-                    }
-                }
-            };
-            if par::worth_forking_bytes(total as usize * elem) {
-                par::parallel_for(units.min(1 << 30), 1, body);
-            } else {
-                body(0, units);
-            }
+            let srcs: Vec<&[f32]> = xs
+                .iter()
+                .map(|p| match p {
+                    PayloadRef::F32(s) => *s,
+                    PayloadRef::I64(_) => unreachable!(),
+                })
+                .collect();
+            copy_concat(
+                par::SyncPtr::new(yd.as_mut_slice().as_mut_ptr()),
+                &srcs,
+                xs_shape,
+                axis,
+                &offs,
+                concat_dim,
+                inner,
+                blocks,
+                units,
+                total,
+                elem,
+            );
         }
         Payload::I64(yd) => {
             yd.clear();
             yd.resize(total as usize, 0);
-            let dstp = par::SyncPtr::new(yd.as_mut_ptr());
-            let body = |ub: usize, ue: usize| {
-                for u in ub..ue {
-                    let (o, rem) = (
-                        u as i64 / (concat_dim * blocks),
-                        u as i64 % (concat_dim * blocks),
-                    );
-                    let (ch, blk) = (rem / blocks, rem % blocks);
-                    let i0 = blk * BLOCK_ELEMS;
-                    let len = BLOCK_ELEMS.min(inner - i0);
-                    if len <= 0 {
-                        continue;
-                    }
-                    let mut si = 0usize;
-                    while si + 1 < xs.len().min(16) && offs[si + 1] <= ch {
-                        si += 1;
-                    }
-                    let PayloadRef::I64(src) = xs[si] else {
-                        unreachable!()
-                    };
-                    let d = xs_shape[si][axis];
-                    let src_off = ((o * d) + (ch - offs[si])) * inner + i0;
-                    let dst_off = ((o * concat_dim) + ch) * inner + i0;
-                    // SAFETY: 块 (o, ch, blk) 与其他并行块不相交。
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            src.as_ptr().add(src_off as usize),
-                            dstp.get().add(dst_off as usize),
-                            len as usize,
-                        );
-                    }
-                }
-            };
-            if par::worth_forking_bytes(total as usize * elem) {
-                par::parallel_for(units.min(1 << 30), 1, body);
-            } else {
-                body(0, units);
-            }
+            let srcs: Vec<&[i64]> = xs
+                .iter()
+                .map(|p| match p {
+                    PayloadRef::I64(s) => *s,
+                    PayloadRef::F32(_) => unreachable!(),
+                })
+                .collect();
+            copy_concat(
+                par::SyncPtr::new(yd.as_mut_ptr()),
+                &srcs,
+                xs_shape,
+                axis,
+                &offs,
+                concat_dim,
+                inner,
+                blocks,
+                units,
+                total,
+                elem,
+            );
         }
     }
     shape

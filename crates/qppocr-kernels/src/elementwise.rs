@@ -78,6 +78,50 @@ fn dim_at(s: &[i64], i: usize) -> i64 {
     if i < rr { s[rr - 1 - i] } else { 1 }
 }
 
+/// 把一个 odometer 推进一步：`idx[i]` 对 `shape[k+i]` 进位，`offs[j]` 按
+/// `strs[j][k+i]` 增减。与原先各站点内联的循环逐操作一致；`no` 是参与推进的
+/// 维数（`idx` 可能按 `no.max(1)` 分配，故不能取 `idx.len()`）。
+#[inline]
+fn step_odometer<const N: usize>(
+    idx: &mut [i64],
+    offs: &mut [i64; N],
+    strs: &[&[i64]; N],
+    shape: &[i64],
+    k: usize,
+    no: usize,
+) {
+    for i in 0..no {
+        let di = k + i;
+        idx[i] += 1;
+        for j in 0..N {
+            offs[j] += strs[j][di];
+        }
+        if idx[i] < shape[di] {
+            return;
+        }
+        idx[i] = 0;
+        for j in 0..N {
+            offs[j] -= strs[j][di] * shape[di];
+        }
+    }
+}
+
+/// 从 0 起把 odometer 前进 `count` 步（每块播种）。
+#[inline]
+fn seed_odometer<const N: usize>(
+    idx: &mut [i64],
+    offs: &mut [i64; N],
+    strs: &[&[i64]; N],
+    shape: &[i64],
+    k: usize,
+    no: usize,
+    count: usize,
+) {
+    for _ in 0..count {
+        step_odometer(idx, offs, strs, shape, k, no);
+    }
+}
+
 fn broadcast_meta(a_shape: &[i64], b_shape: &[i64]) -> Option<BroadcastMeta> {
     let ra = a_shape.len();
     let rb = b_shape.len();
@@ -242,25 +286,15 @@ pub fn binary_op_inplace(a: &mut [f32], a_shape: &[i64], b: &[f32], b_shape: &[i
     let no = r - k;
     let nouter = (total as i64 / runlen) as usize;
 
+    let sbs = [sb.as_slice()];
     let kern = |o0: usize, o1: usize| {
         let mut idx = vec![0i64; no.max(1)];
-        let mut ib: i64 = 0;
+        let mut ob = [0i64];
         // 把 odometer 推进到 o0（ 原样：每块从 0 起推）
-        for _ in 0..o0 {
-            for i in 0..no {
-                let di = k + i;
-                idx[i] += 1;
-                ib += sb[di];
-                if idx[i] < shape[di] {
-                    break;
-                }
-                idx[i] = 0;
-                ib -= sb[di] * shape[di];
-            }
-        }
+        seed_odometer(&mut idx, &mut ob, &sbs, &shape, k, no, o0);
         let opc = op.code(); // 向量/标量分支共用
         for o in o0..o1 {
-            let cv = b[ib as usize];
+            let cv = b[ob[0] as usize];
             // SAFETY: 输出 run [o*runlen, (o+1)*runlen) 两两不相交；
             // b 稠密时 bsrc 从 ib 起有 runlen 个元素（步长 1 的保证）。
             unsafe {
@@ -269,22 +303,13 @@ pub fn binary_op_inplace(a: &mut [f32], a_shape: &[i64], b: &[f32], b_shape: &[i
                     b.as_ptr(),
                     o,
                     runlen as usize,
-                    ib as usize,
+                    ob[0] as usize,
                     b_dense_run,
                     cv,
                     opc,
                 )
             };
-            for i in 0..no {
-                let di = k + i;
-                idx[i] += 1;
-                ib += sb[di];
-                if idx[i] < shape[di] {
-                    break;
-                }
-                idx[i] = 0;
-                ib -= sb[di] * shape[di];
-            }
+            step_odometer(&mut idx, &mut ob, &sbs, &shape, k, no);
         }
     };
     par::parallel_for_elems(nouter, total, kern);
@@ -338,6 +363,8 @@ pub fn binary_op(
     // b 沿最内维（反转序 dim0）稠密 = 步长 1——run 向量化可用 load
     #[allow(clippy::needless_range_loop)]
     let b_dense_inner = r > 0 && strb[0] == 1;
+    // odometer 两操作数的步长表（a 在前、b 在后，与原 ia/ib 增减顺序一致）。
+    let strs = [stra.as_slice(), strb.as_slice()];
 
     // 快路径 1：一侧是单元素
     if a.len() == 1 || b.len() == 1 {
@@ -384,33 +411,20 @@ pub fn binary_op(
             let nouter = (total as i64 / runlen) as usize;
             let kern = |o0: usize, o1: usize| {
                 let mut idx = vec![0i64; no.max(1)];
-                let (mut ia, mut ib): (i64, i64) = (0, 0);
-                for _ in 0..o0 {
-                    for i in 0..no {
-                        let di = k + i;
-                        idx[i] += 1;
-                        ia += stra[di];
-                        ib += strb[di];
-                        if idx[i] < shape[di] {
-                            break;
-                        }
-                        idx[i] = 0;
-                        ia -= stra[di] * shape[di];
-                        ib -= strb[di] * shape[di];
-                    }
-                }
+                let mut offs = [0i64, 0i64];
+                seed_odometer(&mut idx, &mut offs, &strs, &shape, k, no, o0);
                 let opc = op.code();
                 let b_dense_run = b_dense_inner;
                 for o in o0..o1 {
                     let cv = if a_const {
-                        a[ia as usize]
+                        a[offs[0] as usize]
                     } else {
-                        b[ib as usize]
+                        b[offs[1] as usize]
                     };
                     let dense = if a_const {
-                        &b[ib as usize..]
+                        &b[offs[1] as usize..]
                     } else {
-                        &a[ia as usize..]
+                        &a[offs[0] as usize..]
                     };
                     // SAFETY: 输出 run [o*runlen, (o+1)*runlen) 两两不相交；
                     // b 稠密时 dense 从 ib 起有 runlen 个元素（步长 1）。
@@ -428,7 +442,7 @@ pub fn binary_op(
                                 b_head,
                                 o,
                                 runlen as usize,
-                                ib as usize,
+                                offs[1] as usize,
                                 b_dense_run,
                                 cv,
                                 true,
@@ -436,18 +450,7 @@ pub fn binary_op(
                             )
                         };
                         // 尾部推进
-                        for i in 0..no {
-                            let di = k + i;
-                            idx[i] += 1;
-                            ia += stra[di];
-                            ib += strb[di];
-                            if idx[i] < shape[di] {
-                                break;
-                            }
-                            idx[i] = 0;
-                            ia -= stra[di] * shape[di];
-                            ib -= strb[di] * shape[di];
-                        }
+                        step_odometer(&mut idx, &mut offs, &strs, &shape, k, no);
                         continue;
                     }
                     // SAFETY: 输出 run [o*runlen,(o+1)*runlen) 不相交。
@@ -460,18 +463,7 @@ pub fn binary_op(
                         };
                         *d = op.apply(va, vb);
                     }
-                    for i in 0..no {
-                        let di = k + i;
-                        idx[i] += 1;
-                        ia += stra[di];
-                        ib += strb[di];
-                        if idx[i] < shape[di] {
-                            break;
-                        }
-                        idx[i] = 0;
-                        ia -= stra[di] * shape[di];
-                        ib -= strb[di] * shape[di];
-                    }
+                    step_odometer(&mut idx, &mut offs, &strs, &shape, k, no);
                 }
             };
             par::parallel_for_elems(nouter, total, kern);
@@ -482,35 +474,15 @@ pub fn binary_op(
     // 通用路径：odometer 走法（每元素 O(1) 摊还，代替每维一次取模+除法）
     let scalar_kernel = |b0: usize, e0: usize| {
         let mut idx = vec![0i64; r];
-        let (mut ia, mut ib): (i64, i64) = (0, 0);
+        let mut offs = [0i64, 0i64];
         // 推进 odometer 到 b0（ 原样：从 0 起推，每块一次）
-        for _ in 0..b0 {
-            for i in 0..r {
-                idx[i] += 1;
-                ia += stra[i];
-                ib += strb[i];
-                if idx[i] < shape[i] {
-                    break;
-                }
-                idx[i] = 0;
-                ia -= stra[i] * shape[i];
-                ib -= strb[i] * shape[i];
-            }
-        }
+        seed_odometer(&mut idx, &mut offs, &strs, &shape, 0, r, b0);
         for lin in b0 as i64..e0 as i64 {
             // SAFETY: 元素 lin 与其他并行块不相交。
-            unsafe { *yp.get().add(lin as usize) = op.apply(a[ia as usize], b[ib as usize]) };
-            for i in 0..r {
-                idx[i] += 1;
-                ia += stra[i];
-                ib += strb[i];
-                if idx[i] < shape[i] {
-                    break;
-                }
-                idx[i] = 0;
-                ia -= stra[i] * shape[i];
-                ib -= strb[i] * shape[i];
-            }
+            unsafe {
+                *yp.get().add(lin as usize) = op.apply(a[offs[0] as usize], b[offs[1] as usize])
+            };
+            step_odometer(&mut idx, &mut offs, &strs, &shape, 0, r);
         }
     };
     if nobc {

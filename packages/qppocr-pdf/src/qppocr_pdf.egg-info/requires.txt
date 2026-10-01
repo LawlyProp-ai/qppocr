@@ -1,0 +1,10 @@
+qppocr
+pypdfium2==5.13.0
+Pillow>=10
+
+[dev]
+pytest>=8
+ruff
+mypy
+bandit
+pip-audit
